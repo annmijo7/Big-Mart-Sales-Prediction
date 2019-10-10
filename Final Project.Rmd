@@ -1,0 +1,232 @@
+---
+title: "Big Mart Sales Prediction"
+author: "Ann Joseph"
+date: "April 24, 2019"
+output:
+  html_document:
+    toc: yes
+    theme: united
+---
+
+##1. Introduction
+For this project, a data set containing information about the sales in 2013 of 1559 products across 10 BigMart stores in different cities were used. The data set can be found at Analytics Vidhya, https://datahack.analyticsvidhya.com/contest/practice-problem-big-mart-sales-iii/. Using this information, this project aims to not only predict sale of a product at a particular store but to also understand the which predictors are important in increasing sales of a product.
+
+The models built in this project are Random Forest, Multivariate Adaptive Regression Splines (MARS) and Support Vector Machines (SVM). The adjusted R^2^ and the Root Mean Square Error (RMSE) is used to compare model performance and choose the best one out of the three.
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align="center")
+knitr::opts_chunk$set(fig.pos = 'H')
+knitr::opts_chunk$set(message=FALSE)
+knitr::opts_chunk$set(warning=FALSE)
+library(data.table) 
+library(dplyr)  
+library(dmm)
+library(ggplot2)     
+library(caret)      
+library(corrplot)   
+library(xgboost)    
+library(cowplot)
+library(knitr)
+library(gridExtra)
+library(grid)
+library(randomForest)
+
+bigm = read.csv(file ="Train.csv")
+```
+
+Table 1.1. shows the columns in this data set along with their descriptions. From below, Item_Outlet_Sales will be the response variable in this analysis and all the other variables are the predictor variables. The dataset has 8523 rows in total.
+
+```{r, echo=FALSE}
+newtable <- matrix(c("Item_Identifier", "Unique product ID","Item_Weight", "Weight of product","Item_Fat_Content", "Fat Content of product (Low fat or Regular)","Item_Visibility", "The % of total display area allocated to a product","Item_Type", "The category to which the product belongs","Item_MRP", "Maximum Retail Price of the product","Outlet_Identifier", "Unique store ID","Outlet_Establishment_Year", "The year in which store was established","Outlet_Size", "The size of the store","Outlet_Location_Type", "The type of city in which the store is located","Outlet_Type", "Type of outlet (Grocery store or Supermarket)","Item_Outlet_Sales", "Sales of the product"),ncol=2,byrow=TRUE)
+colnames(newtable)<- c("Column Name", "Description")
+rownames(newtable)<-c(1:12)
+newtable <- as.table(newtable)
+grid.table(newtable)
+```
+<center> Table 1.1. Colum Description </center>
+
+##2. Data Exploration
+First, visualization is done to get a better understanding of the information the data portrays. The following are a few insightful plots.
+
+```{r, echo=FALSE}
+#DATA EXPLORATION
+ggplot(bigm) + geom_histogram(aes(bigm$Item_Outlet_Sales), binwidth = 100, fill = "darkred") +  xlab("Item Sales")+ ggtitle("Figure 2.1 Number of sales")
+```
+
+Figure 2.1 shows the distribution of the sales of items in the data set, which is the response variable in this analysis. It can be seen that this variable is not normally distributed and hence, some transformation is required before models are built.
+
+```{r, echo=FALSE}
+#plot_grid(p2, p3, nrow = 1) 
+
+# Item_Visibility vs Item_Outlet_Sales 
+ggplot(bigm) + geom_point(aes(Item_Visibility, Item_Outlet_Sales), colour = "darkgreen", alpha = 0.3) + theme(axis.title = element_text(size = 8.5)) +xlab("Visibility of the Product") + ylab("Sales of the product")+ ggtitle("Figure 2.2 Relationship between the Visibility and Sales of a product")
+```
+
+In Figure 2.2, a string of points at Visibility=0 can be seen. This does not make sense since visibility of a product is never 0. This means that it is a missing value and needs to be taken care of at the data preprocessing step.
+
+```{r, echo=FALSE}
+
+# Item_MRP vs Item_Outlet_Sales 
+ggplot(bigm) + geom_point(aes(Item_MRP, Item_Outlet_Sales), colour = "violet", alpha = 0.3) + theme(axis.title = element_text(size = 8.5)) +xlab("Maximum Retail Price (MRP) of the Product") + ylab("Sales of the product") + ggtitle("Figure 2.3 Relationship between the MRP and Sales")
+#Item_MRP vs Item_Outlet_Sales, we can clearly see 4 segments of prices that can be used in feature engineering to create a new variable.
+
+```
+
+In Figure 2.3, we see that there is a positive relationship between the MRP of a product and its sales in a particular store. It can also be noted that there are 4 segments of prices that the MRP of products is divided into. 
+
+```{r, echo=FALSE}
+ggplot(bigm %>% group_by(Outlet_Type) %>% summarise(Count = n())) +   geom_bar(aes(Outlet_Type, Count), stat = "identity", fill = "skyblue") +  geom_label(aes(factor(Outlet_Type), Count, label = Count), vjust = 0.5) +  theme(axis.text.x = element_text(size = 8.5)) + xlab("Outlet Type") + ggtitle("Figure 2.4 Number of Outlet Types")
+#Supermarket Type 1 seems to be the most popular category of Outlet_Type
+```
+
+From Figure 2.4, we see that more than 5000 products in this data set are from 'Supermarket Type 1' and that the other outlet types have only around 1000 products each.
+
+##3. Data Preprocessing
+Once a better understanding of the data was obtained through different visualizations, it is important to clean the data and make it ready for data modelling. This includes handling missing values, removing columns that are insignificant to the analysis, removing duplicate rows, handling outliers, etc.
+
+In this dataset, first, the predictor "Item_Fat_Content", a measure of the fat content in a product, was cleaned up. This variable should have only two values- Low Fat and Regular but other values such as 'LF', 'low fat' and 'reg' were included in this data set. These were corrected into either 'Low Fat' or 'Regular'
+
+```{r, include=FALSE}
+bigm$Item_Fat_Content[bigm$Item_Fat_Content == "LF"] = "Low Fat" 
+bigm$Item_Fat_Content[bigm$Item_Fat_Content == "low fat"] = "Low Fat" 
+bigm$Item_Fat_Content[bigm$Item_Fat_Content == "reg"] = "Regular" 
+```
+
+Next, there were missing values in the predictor "Item_Weight." These blank values are replaced with the average weight for that type pf product. For example, if a product is of type "Snack Foods" and has a missing value, the average weight of products of type "Snack Foods" is calculated and blank values are replaced with this average weight calculated. This is done for all missing values and types of products.
+
+```{r, include=FALSE}
+summary(bigm$Item_Type)
+#MISSING VALUES
+sum(is.na(bigm$Item_Weight)==TRUE)
+#With mean
+baking<-bigm[bigm[,"Item_Type"]=="Baking Goods",]
+baking_av <- mean(baking$Item_Weight, na.rm = T)
+br<-bigm[bigm[,"Item_Type"]=="Breads",]
+br_av <- mean(br$Item_Weight, na.rm = T)
+breakfast<-bigm[bigm[,"Item_Type"]=="Breakfast",]
+breakfast_av <- mean(breakfast$Item_Weight, na.rm = T)
+can<-bigm[bigm[,"Item_Type"]=="Canned",]
+can_av <- mean(can$Item_Weight, na.rm = T)
+dairy<-bigm[bigm[,"Item_Type"]=="Dairy",]
+dairy_av <- mean(dairy$Item_Weight, na.rm = T)
+ff<-bigm[bigm[,"Item_Type"]=="Frozen Foods",]
+ff_av <- mean(ff$Item_Weight, na.rm = T)
+fv<-bigm[bigm[,"Item_Type"]=="Fruits and Vegetables",]
+fv_av <- mean(fv$Item_Weight, na.rm = T)
+hd<-bigm[bigm[,"Item_Type"]=="Hard Drinks",]
+hd_av <- mean(hd$Item_Weight, na.rm = T)
+hh<-bigm[bigm[,"Item_Type"]=="Health and Hygiene",]
+hh_av <- mean(hh$Item_Weight, na.rm = T)
+house<-bigm[bigm[,"Item_Type"]=="Household",]
+house_av <- mean(house$Item_Weight, na.rm = T)
+meat<-bigm[bigm[,"Item_Type"]=="Meat",]
+meat_av <- mean(meat$Item_Weight, na.rm = T)
+others<-bigm[bigm[,"Item_Type"]=="Others",]
+others_av <- mean(others$Item_Weight, na.rm = T)
+sea<-bigm[bigm[,"Item_Type"]=="Seafood",]
+sea_av <- mean(sea$Item_Weight, na.rm = T)
+snack<-bigm[bigm[,"Item_Type"]=="Snack Foods",]
+snack_av <- mean(snack$Item_Weight, na.rm = T)
+soft<-bigm[bigm[,"Item_Type"]=="Soft Drinks",]
+soft_av <- mean(soft$Item_Weight, na.rm = T)
+sf<-bigm[bigm[,"Item_Type"]=="Starchy Foods",]
+sf_av <- mean(sf$Item_Weight, na.rm = T)
+
+sum(is.na(bigm$Item_Weight))
+missing_index = which(is.na(bigm$Item_Weight)) 
+for(i in missing_index)
+{
+  if(bigm[i,"Item_Type"]=="Baking Goods"){
+    bigm[i,"Item_Weight"]=baking_av
+  } else if(bigm[i,"Item_Type"]=="Breads"){
+    bigm[i,"Item_Weight"]=br_av
+  } else if(bigm[i,"Item_Type"]=="Breakfast"){
+    bigm[i,"Item_Weight"]=breakfast_av
+  } else if(bigm[i,"Item_Type"]=="Canned"){
+    bigm[i,"Item_Weight"]=can_av
+  } else if(bigm[i,"Item_Type"]=="Dairy"){
+    bigm[i,"Item_Weight"]=dairy_av
+  } else if(bigm[i,"Item_Type"]=="Frozen Foods"){
+    bigm[i,"Item_Weight"]=ff_av
+  } else if(bigm[i,"Item_Type"]=="Fruits and Vegetables"){
+    bigm[i,"Item_Weight"]=fv_av
+  } else if(bigm[i,"Item_Type"]=="Hard Drinks"){
+    bigm[i,"Item_Weight"]=hd_av
+  } else if(bigm[i,"Item_Type"]=="Health and Hygiene"){
+    bigm[i,"Item_Weight"]=hh_av
+  } else if(bigm[i,"Item_Type"]=="Household"){
+    bigm[i,"Item_Weight"]=house_av
+  } else if(bigm[i,"Item_Type"]=="meat"){
+    bigm[i,"Item_Weight"]=meat_av
+  } else if(bigm[i,"Item_Type"]=="Others"){
+    bigm[i,"Item_Weight"]=others_av
+  } else if(bigm[i,"Item_Type"]=="Seafood"){
+    bigm[i,"Item_Weight"]=sea_av
+  } else if(bigm[i,"Item_Type"]=="Snack Foods"){
+    bigm[i,"Item_Weight"]=snack_av
+  } else if(bigm[i,"Item_Type"]=="Soft Drinks"){
+    bigm[i,"Item_Weight"]=soft_av
+  } else if(bigm[i,"Item_Type"]=="Starchy Foods"){
+    bigm[i,"Item_Weight"]=sf_av
+  }
+  
+  #item = bigm$Item_Identifier[i]  
+  #bigm$Item_Weight[i] = mean(bigm$Item_Weight[bigm$Item_Identifier == item], na.rm = T) 
+}
+```
+
+Similarly, in the data exploration and visualization step, we saw in Figure 2.2 that there are 0's in the Item_Visibility column. These are also replaced by the mean of the column since it a product could not have zero visibility.
+
+```{r, include=FALSE}
+zero_index = which(bigm$Item_Visibility == 0) 
+for(i in zero_index){    
+  item = bigm$Item_Identifier[i]  
+  bigm$Item_Visibility[i] = mean(bigm$Item_Visibility[bigm$Item_Identifier == item], na.rm = T)  
+  }
+```
+
+Next, on looking at the column 'Item_Identifier,' it is seen that the unique ids of the products each start with either 'DC, 'FD' or 'NC.' Upon some research about what these values mean, it was found that they stand for 'drink', 'food' and 'non-consumable' respectively. These are put into a new column called 'Item_category.' It is intuitive that non-consumable products do not have any fat content that is important. Hence, the fat content of non-consumable products, where all had th value 'Low Fat' are changed to 'NC.'
+
+```{r, include=FALSE}
+bigm[,"Item_category"] = substr(bigm$Item_Identifier, 1, 2)
+bigm$Item_Fat_Content <- as.character(bigm$Item_Fat_Content)
+bigm$Item_Fat_Content[bigm$Item_category == "NC"] = "NC"
+bigm$Item_Fat_Content <- as.factor(bigm$Item_Fat_Content)
+r<-which(is.na(bigm)==TRUE)
+
+bigm<-bigm[-r,]
+```
+
+##4.Data Modelling
+The three modelling techniques used in this project are Random Forests, Support Vector Machines (SVM) and Multivariate Adaptive Regression Splines (MARS). These models were built and their parameters were tuned using cross validation to achieve the model with the best RMSE. 
+
+In the Random Forest model, the RMSE is 1188.02, R^2^ is 53.76% and the MAE is 869.7.
+In the MARS model, the RMSE is 1123.506, R^2^ is 55.84% and the MAE is 836.04.
+In the SVM linear model, the RMSE is 1139.1, R^2^ is 55.78% and the MAE is 828.18.
+```{r, include=FALSE}
+#Random Forest
+control <- trainControl(method="cv", number=10)
+set.seed(1234)
+metric <- "RMSE"
+mtry <- sqrt(ncol(bigm))
+tunegrid <- expand.grid(.mtry=mtry)
+rf_default <- train(Item_Outlet_Sales~., data=bigm[,-c(1)], method="rf", metric=metric, tuneGrid=tunegrid, trControl=control, na.action=na.exclude)
+print(rf_default) #RMSE 1188.02, Rsqu 53.76, MAE 869.7
+
+#MARS
+set.seed(1234)
+mars_model <- train( Item_Outlet_Sales~., data = bigm[,-c(1)], method = "gcvEarth",
+                     trControl=control, metric=metric,
+                    preProcess = c("center", "scale"),
+                    tuneLength = 10, na.action=na.exclude)
+print(mars_model) ##RMSE 1123.506, Rsqu 55.84, MAE 836.04
+
+#SVM
+svm_Linear <- train( Item_Outlet_Sales~., data = bigm[,-c(1)], method = "svmLinear",
+                    trControl=control, metric=metric,
+                    preProcess = c("center", "scale"), na.action=na.exclude,
+                    tuneLength = 10)
+print(svm_Linear) #1139.14, 55.78,828.18
+```
+
+##Results and Conclusion
+Analysis was done on the sales of BigMart outlet stores in 10 different cities and after data visualization and  data preprocessing steps, three different models were built. These were random forest models, MARS models and SVM models. Parameters of each of these models were tuned using cross validation and it was found that the MARS model was the best with an RMSE of 1123.506. 
